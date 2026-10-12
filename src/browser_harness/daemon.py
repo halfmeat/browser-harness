@@ -682,7 +682,9 @@ class Daemon:
         self.cdp._event_registry.handle_event = tap
 
     async def _new_cdp_client(self):
-        url = get_ws_url()
+        # get_ws_url() may poll (urllib + time.sleep) until the browser is back;
+        # run it off the event-loop thread so IPC (ping → ready=false) stays responsive.
+        url = await asyncio.to_thread(get_ws_url)
         log(f"connecting to {_safe_connection_label(url)}")
         cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
         await cdp.start()
