@@ -6,6 +6,7 @@ from pathlib import Path
 
 from . import _ipc as ipc
 from . import auth
+from . import cdp_policy  # imported before _load_env(): captures BH_CDP_POLICY from the trusted host env
 from . import paths
 from cdp_use.client import CDPClient
 
@@ -29,6 +30,18 @@ def _load_env_file(p):
 
 
 _load_env()
+
+# Resolved from the value cdp_policy captured at import, i.e. from the trusted
+# host environment BEFORE the workspace .env above could touch it: None =
+# upstream-compatible mode, "v1" = hardened policy mode. An unrecognized value
+# raises here and the daemon never serves (fail closed).
+POLICY_MODE = cdp_policy.resolve_selector(cdp_policy.captured_raw())
+
+# Sentinel: _enforce_policy() returns it when a request is allowed to fall
+# through to the normal meta handlers in handle().
+_POLICY_PASS = object()
+# Budget for ping's trusted live-state check (client ping timeout is 1 s).
+_PING_LIVE_TIMEOUT = 0.75
 
 NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
@@ -437,7 +450,21 @@ class Daemon:
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        self.dialog_session = None
+        self.dialog_generation = None  # policy mode: connection generation the dialog was seen in
         self.stop = None  # asyncio.Event, set inside start()
+        # In policy mode every IPC request is screened in handle() before any
+        # model-origin send_raw; None keeps the daemon upstream-compatible.
+        self.policy = None
+        self._policy_watch = None
+        self._policy_discovering = {}  # iframe target_id -> trusted discovery task
+        if POLICY_MODE == cdp_policy.POLICY_VERSION:
+            self._attach_policy(cdp_policy.PolicyEngine())
+
+    def _attach_policy(self, engine):
+        """Enable policy mode with ``engine`` and wire revocation → meta cleanup."""
+        self.policy = engine
+        engine.registry.revoke_listeners.append(self._policy_on_revoke)
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -614,6 +641,11 @@ class Daemon:
         """Mark the controlled tab without extending the synchronous IPC path."""
         if not tab_marker_enabled():
             return None
+        # Policy mode: only ever touch the current, valid, owned page.
+        if self.policy is not None:
+            reg = self.policy.registry
+            if session_id is None or session_id != reg.current_session_id or not reg.current_pair_valid():
+                return None
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw(
                 "Runtime.evaluate",
@@ -624,13 +656,37 @@ class Daemon:
         )))
 
     def _record_event(self, method, params, session_id=None):
+        if self.policy is not None:
+            self._policy_observe(method, params, session_id)
+            # Policy mode buffers/surfaces only events of currently owned sessions:
+            # browser-level and foreign/revoked-session events never reach the model.
+            if not (isinstance(session_id, str) and self.policy.registry.session_owned(session_id)):
+                return
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
+            self.dialog_session = session_id
+            self.dialog_generation = self.policy.registry.generation if self.policy is not None else None
         elif method == "Page.javascriptDialogClosed":
-            self.dialog = None
+            if self.policy is None or self.dialog_session == session_id:
+                self.dialog = None
+                self.dialog_session = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(self.session)
+
+    def _install_event_tap(self):
+        orig = self.cdp._event_registry.handle_event
+        async def tap(method, params, session_id=None):
+            self._record_event(method, params, session_id)
+            return await orig(method, params, session_id)
+        self.cdp._event_registry.handle_event = tap
+
+    async def _new_cdp_client(self):
+        url = get_ws_url()
+        log(f"connecting to {_safe_connection_label(url)}")
+        cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
+        await cdp.start()
+        return cdp
 
     async def start(self):
         self.stop = asyncio.Event()
@@ -655,14 +711,460 @@ class Daemon:
                     "browser-harness did not retry or create another connection"
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
-        await self.attach_first_page()
-        orig = self.cdp._event_registry.handle_event
-        async def tap(method, params, session_id=None):
-            self._record_event(method, params, session_id)
-            return await orig(method, params, session_id)
-        self.cdp._event_registry.handle_event = tap
+        if self.policy is not None:
+            # Monitoring is live BEFORE policy can become ready.
+            self._install_event_tap()
+            await self._start_policy()
+            self._policy_watch = asyncio.create_task(self._watch_policy_connection())
+        else:
+            await self.attach_first_page()
+            self._install_event_tap()
 
-    async def handle(self, req):
+    # ── policy mode (BH_CDP_POLICY=v1) ───────────────────────────────────────
+    async def _trusted_send(self, method, params=None, session_id=None):
+        """Daemon-internal (trusted) CDP channel. Never reachable from IPC input:
+        only daemon code chooses the method, and ids come from the registry."""
+        return await self.cdp.send_raw(method, params or {}, session_id=session_id)
+
+    async def _enable_policy_monitoring(self, session_id):
+        """Page.enable is CRITICAL in policy mode (navigation + dialog monitoring):
+        failure raises. The remaining default domains are best effort."""
+        await asyncio.wait_for(self._trusted_send("Page.enable", {}, session_id), timeout=4)
+        self.policy.registry.mark_page_monitored(session_id)
+
+        async def enable_one(d):
+            try:
+                await asyncio.wait_for(self._trusted_send(f"{d}.enable", {}, session_id), timeout=4)
+            except Exception as e:
+                log(f"enable {d} on {session_id}: {e}")
+        await asyncio.gather(*(enable_one(d) for d in ("DOM", "Runtime", "Network")))
+
+    async def _start_policy(self):
+        """Hardened policy-mode startup contract. Each step is a TRUSTED internal
+        CDP call; any failure raises so the generation never becomes ready with a
+        partial policy (fail closed, no unrestricted fallback).
+
+        Order: create a separate Hermes browser context → install download-deny
+        on it → enable target lifecycle monitoring → create about:blank inside it
+        and confirm it → register → attach → register session → critical Page
+        monitoring → current pair → ready. Never attaches to a pre-existing page."""
+        pol, reg = self.policy, self.policy.registry
+        if not pol.management_available:
+            raise RuntimeError(
+                f"policy v1 fail-closed: management peer isolation unavailable on this "
+                f"platform ({pol.management_detail})"
+            )
+        send = self._trusted_send
+        ctx = (await send("Target.createBrowserContext", {}))["browserContextId"]
+        reg.begin_generation(ctx)
+        gen = reg.generation
+        # Deny downloads for the whole Hermes context. No downloadPath. Model IPC
+        # can never reach this method (not allowlisted).
+        await send("Browser.setDownloadBehavior", {
+            "behavior": "deny", "browserContextId": ctx, "eventsEnabled": True})
+        reg.download_deny_generation = gen
+        await send("Target.setDiscoverTargets", {"discover": True})
+        reg.discovery_generation = gen
+        tid = (await send("Target.createTarget", {
+            "url": "about:blank", "browserContextId": ctx, "background": True}))["targetId"]
+        info = (await send("Target.getTargetInfo", {"targetId": tid})).get("targetInfo") or {}
+        if (info.get("targetId") != tid or info.get("type") != "page"
+                or not reg.context_matches(info.get("browserContextId")) or info.get("url") != "about:blank"):
+            raise RuntimeError("policy v1 fail-closed: initial Hermes page not confirmed in the Hermes context")
+        if not reg.add_page(tid, "about:blank"):
+            raise RuntimeError("policy v1 fail-closed: could not register initial Hermes target")
+        sid = (await send("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+        if not reg.register_session(sid, tid):
+            raise RuntimeError("policy v1 fail-closed: could not register initial Hermes session")
+        try:
+            await self._enable_policy_monitoring(sid)
+        except Exception as e:
+            raise RuntimeError(f"policy v1 fail-closed: critical Page monitoring failed: {e}") from None
+        if reg.generation != gen or not reg.session_owned(sid):
+            raise RuntimeError("policy v1 fail-closed: ownership changed during startup")
+        reg.set_current(sid, tid)
+        self.session = sid
+        self.target_id = tid
+        reg.initial_ready = True
+        log(f"policy v1 ready: context={ctx} generation={gen}")
+
+    def _policy_observe(self, method, params, session_id):
+        try:
+            self.policy.observe_event(method, params, session_id)
+            candidate = self.policy.discovery_candidate(method, params)
+        except Exception as e:  # a broken monitor must never fail open
+            self.policy.registry.monitoring_failed = True
+            log(f"policy: event monitoring failed ({type(e).__name__}); not ready")
+            return
+        if candidate is not None and candidate not in self._policy_discovering:
+            self._policy_discovering[candidate] = asyncio.create_task(self._policy_discover(candidate))
+
+    async def _policy_discover(self, target_id):
+        """TRUSTED iframe discovery, triggered only by browser lifecycle events.
+        This — not model-origin Target.getTargets or attach — is what registers an
+        iframe (after the parent-chain proof in PolicyEngine.discover_iframe)."""
+        try:
+            if await self.policy.discover_iframe(self._trusted_send, target_id):
+                log(f"policy: iframe {target_id} registered by trusted discovery")
+        except cdp_policy.Denied as e:
+            log(f"policy: iframe {target_id} not registered ({e})")
+        except Exception as e:
+            log(f"policy: iframe discovery error ({type(e).__name__}); not registered")
+        finally:
+            self._policy_discovering.pop(target_id, None)
+
+    async def _policy_cancel_discovery(self):
+        tasks = list(self._policy_discovering.values())
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _policy_on_revoke(self, sessions, targets):
+        """Ownership lost: drop model-visible meta state tied to it."""
+        if sessions:
+            self.events = deque((e for e in self.events if e.get("session_id") not in sessions), maxlen=BUF)
+            if self.dialog_session in sessions:
+                self.dialog = None
+                self.dialog_session = None
+        if self.policy.registry.current_session_id is None:
+            self.session = None
+            self.target_id = None
+
+    async def _watch_policy_connection(self):
+        """Policy mode: a dropped CDP connection immediately makes the policy
+        not-ready, then a full policy reinstall is attempted on a new connection."""
+        while not self._shutting_down:
+            task = getattr(self.cdp, "_message_handler_task", None)
+            if task is None:
+                return
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    raise
+            except Exception:
+                pass
+            if self._shutting_down:
+                return
+            self._policy_connection_lost()
+            if not await self._policy_reconnect():
+                return
+
+    def _policy_connection_lost(self):
+        self.policy.registry.mark_disconnected()
+        self.session = None
+        self.target_id = None
+        log("policy: CDP connection lost; not ready until the policy is reinstalled")
+
+    async def _policy_reconnect(self, attempts=3):
+        """New connection → new generation → new Hermes context → download-deny →
+        monitoring → owned page/session → only then ready. Never adopts a foreign
+        tab. On failure the policy stays not-ready (fail closed)."""
+        reg = self.policy.registry
+        old_ctx = reg.browser_context_id
+        for attempt in range(attempts):
+            if self._shutting_down:
+                return False
+            try:
+                self.cdp = await self._new_cdp_client()
+                self._install_event_tap()
+                await self._start_policy()
+                if old_ctx and old_ctx != reg.browser_context_id:
+                    try:
+                        await self._trusted_send("Target.disposeBrowserContext", {"browserContextId": old_ctx})
+                    except Exception:
+                        pass
+                log(f"policy: reconnected, generation={reg.generation}")
+                return True
+            except Exception as e:
+                log(f"policy: reconnect attempt {attempt + 1}/{attempts} failed: {e}")
+                failed_ctx = reg.browser_context_id
+                reg.mark_disconnected()
+                if failed_ctx and failed_ctx != old_ctx and self.cdp is not None:
+                    await self._trusted_cleanup("Target.disposeBrowserContext", {"browserContextId": failed_ctx})
+                await asyncio.sleep(min(2 ** attempt, 5))
+        return False
+
+    def _policy_current_dialog_open(self):
+        """A JS dialog is CONFIRMED open on the current owned pair: reported by
+        Page.javascriptDialogOpening on the current, owned, Page-monitored session
+        in this connection generation (foreign/revoked sessions never record a
+        dialog) and not yet closed. Only this enables ping's degraded check."""
+        reg = self.policy.registry
+        sid = reg.current_session_id
+        return (self.dialog is not None and sid is not None and self.dialog_session == sid
+                and self.dialog_generation == reg.generation and reg.page_monitored(sid)
+                and reg.current_pair_valid())
+
+    async def _policy_live_check(self):
+        """Trusted live refresh of the current (session, page) pair for the ping
+        attestation, bounded so ping stays responsive. FULL refresh
+        (Target.getTargetInfo + Page.getFrameTree identity/URL) unless a dialog is
+        confirmed open on the current owned pair: the dialog blocks the renderer,
+        so only then the degraded browser-side Target.getTargetInfo check is used.
+        Any doubt → False; forbidden/contradictory state is revoked by the refresh."""
+        reg = self.policy.registry
+        if not reg.infrastructure_ok() or not reg.current_pair_valid():
+            return False
+        tid, sid, gen = reg.current_target_id, reg.current_session_id, reg.generation
+        frames = not self._policy_current_dialog_open()
+        try:
+            await asyncio.wait_for(
+                self.policy.refresh_target(self._trusted_send, tid, sid, frames=frames), _PING_LIVE_TIMEOUT)
+        except Exception:
+            return False
+        return (self._token_ok(gen, sid, tid) and reg.current_target_id == tid
+                and reg.current_session_id == sid and reg.current_pair_valid())
+
+    def _token_ok(self, gen, session_id=None, target_id=None):
+        """Revalidated after every await of a model operation."""
+        reg = self.policy.registry
+        return (reg.generation == gen and reg.infrastructure_ok()
+                and (session_id is None or reg.session_owned(session_id))
+                and (target_id is None or reg.target_owned(target_id)))
+
+    async def _model_send(self, method, params, session_id=None):
+        """The single model-origin dispatch, reached only after validation,
+        ownership and trusted state checks. Returns (ok, result_or_error)."""
+        try:
+            return True, await self.cdp.send_raw(method, params, session_id=session_id)
+        except Exception as e:
+            return False, str(e)
+
+    async def _trusted_cleanup(self, method, params):
+        try:
+            await asyncio.wait_for(self._trusted_send(method, params), timeout=5)
+        except Exception as e:
+            log(f"policy: trusted cleanup {method} failed: {e}")
+
+    async def _enforce_policy(self, req, meta, peer):
+        """Screen one model-origin IPC request. Returns ``_POLICY_PASS`` only for a
+        management meta whose peer passed the kernel check; everything else
+        (including ``ping`` with its live attestation) is fully handled here. A denied request performs ZERO
+        privileged action. Unexpected errors are normalized to a controlled deny
+        (never left to the outer serve() handler)."""
+        try:
+            return await self._policy_dispatch(req, meta, peer)
+        except cdp_policy.Denied as d:
+            return {"error": f"policy: {d}"}
+        except Exception as e:
+            log(f"policy: internal error, request denied ({type(e).__name__}: {e})")
+            return {"error": "policy: request denied (internal error)"}
+
+    async def _policy_dispatch(self, req, meta, peer):
+        pol, reg = self.policy, self.policy.registry
+        if meta is not None:
+            kind = cdp_policy.classify_meta(meta)
+            if kind == "management":
+                ok, detail = pol.check_management_peer(peer)
+                if not ok:
+                    log(f"policy: management meta {meta!r} denied ({detail.get('reason')})")
+                    return {"error": "management request denied by policy"}
+                return _POLICY_PASS
+            if kind == "untrusted":
+                return await self._policy_set_session(req)
+            if kind == "model":
+                if meta == "ping":
+                    live = await self._policy_live_check()
+                    return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND,
+                            "policy": pol.attestation(live_state=live)}
+                return await self._policy_model_meta(meta)
+            raise cdp_policy.Denied(f"meta not permitted: {meta}")
+        method = req.get("method")
+        if not isinstance(method, str):
+            raise cdp_policy.Denied("request had neither a known meta nor a method")
+        if not reg.infrastructure_ok():
+            raise cdp_policy.Denied("policy not operational (not ready)")
+        norm = pol.validate(method, req.get("params"))
+        session_id = req.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise cdp_policy.Denied("session_id must be a string")
+        if method in cdp_policy.SESSION_SCOPED:
+            return await self._policy_session_call(method, norm, session_id)
+        if method in ("Target.getTargets", "Browser.getVersion"):
+            gen = reg.generation
+            ok, res = await self._model_send(method, norm)
+            if not ok:
+                return {"error": res}
+            if method == "Target.getTargets":
+                # Every owned entry passes a trusted live refresh before exposure.
+                res = await pol.visible_targets(self._trusted_send, res)
+                if not self._token_ok(gen):
+                    raise cdp_policy.Denied("connection changed during target listing")
+            return {"result": res}
+        handler = {
+            "Target.createTarget": self._policy_create_target,
+            "Target.attachToTarget": self._policy_attach,
+            "Target.detachFromTarget": self._policy_detach,
+            "Target.activateTarget": self._policy_activate,
+            "Target.closeTarget": self._policy_close,
+        }.get(method)
+        if handler is None:
+            raise cdp_policy.Denied(f"method not permitted: {method}")
+        return await handler(norm)
+
+    async def _policy_session_call(self, method, norm, session_id):
+        pol, reg = self.policy, self.policy.registry
+        explicit = session_id is not None
+        sid = session_id if explicit else reg.current_session_id
+        if sid is None or not reg.session_owned(sid):
+            raise cdp_policy.Denied("session not owned")
+        if not explicit and not reg.current_pair_valid():
+            raise cdp_policy.Denied("no valid owned current page")
+        tid = reg.target_for_session(sid)
+        gen = reg.generation
+        # An open JS dialog blocks the renderer, so Page.getFrameTree could hang;
+        # dialog handling refreshes via browser-side Target.getTargetInfo only.
+        await pol.refresh_target(self._trusted_send, tid, sid,
+                                 frames=method != "Page.handleJavaScriptDialog")
+        if not self._token_ok(gen, sid, tid):
+            raise cdp_policy.Denied("ownership changed during state refresh")
+        ok, res = await self._model_send(method, norm, sid)
+        if not self._token_ok(gen, sid, tid):
+            raise cdp_policy.Denied("ownership lost during call; result discarded")
+        return {"result": res} if ok else {"error": res}
+
+    async def _policy_create_target(self, norm):
+        pol, reg = self.policy, self.policy.registry
+        gen = reg.generation
+        ok, res = await self._model_send("Target.createTarget", norm)
+        if not ok:
+            return {"error": res}
+        tid = res.get("targetId") if isinstance(res, dict) else None
+        if not isinstance(tid, str) or not tid:
+            raise cdp_policy.Denied("createTarget returned no target")
+        try:
+            if not self._token_ok(gen):
+                raise cdp_policy.Denied("connection changed; new target discarded")
+            info = await pol._target_info(self._trusted_send, tid)
+            if (info.get("targetId") != tid or info.get("type") != "page"
+                    or not reg.context_matches(info.get("browserContextId")) or info.get("url") != "about:blank"):
+                raise cdp_policy.Denied("new target not confirmed in the Hermes context")
+            if not self._token_ok(gen) or not reg.add_page(tid, "about:blank"):
+                raise cdp_policy.Denied("ownership changed; new target discarded")
+        except cdp_policy.Denied:
+            await self._trusted_cleanup("Target.closeTarget", {"targetId": tid})
+            raise
+        return {"result": res}
+
+    async def _policy_attach(self, norm):
+        pol, reg = self.policy, self.policy.registry
+        tid = norm["targetId"]
+        # Only an already-registered target (trusted creation / trusted iframe
+        # discovery). A model-named unknown id is never proven or adopted here.
+        if not reg.target_owned(tid):
+            raise cdp_policy.Denied("target not owned")
+        gen = reg.generation
+        sid_for_refresh = reg.session_for_target(tid) if reg.target_type(tid) == "page" else None
+        await pol.refresh_target(self._trusted_send, tid, sid_for_refresh)
+        if not self._token_ok(gen, target_id=tid):
+            raise cdp_policy.Denied("ownership changed before attach")
+        ok, res = await self._model_send("Target.attachToTarget", norm)
+        if not ok:
+            return {"error": res}
+        sid = res.get("sessionId") if isinstance(res, dict) else None
+        if not isinstance(sid, str) or not sid:
+            raise cdp_policy.Denied("attach returned no session")
+        committed = self._token_ok(gen, target_id=tid) and reg.register_session(sid, tid)
+        if not committed:
+            await self._trusted_cleanup("Target.detachFromTarget", {"sessionId": sid})
+            raise cdp_policy.Denied("ownership changed during attach; session discarded")
+        return {"result": res}
+
+    async def _policy_detach(self, norm):
+        pol, reg = self.policy, self.policy.registry
+        sid = norm["sessionId"]
+        tid = reg.target_for_session(sid)
+        if tid is None:
+            raise cdp_policy.Denied("session not owned")
+        gen = reg.generation
+        # Same live-state proof as every other model action on an owned target.
+        await pol.refresh_target(self._trusted_send, tid, sid)
+        if not self._token_ok(gen, sid, tid) or reg.target_for_session(sid) != tid:
+            raise cdp_policy.Denied("ownership changed during state refresh")
+        ok, res = await self._model_send("Target.detachFromTarget", norm)
+        if ok and reg.generation == gen:
+            reg.forget_session(sid)
+        return {"result": res} if ok else {"error": res}
+
+    async def _policy_activate(self, norm):
+        pol, reg = self.policy, self.policy.registry
+        tid = norm["targetId"]
+        gen = reg.generation
+        await pol.refresh_target(self._trusted_send, tid, reg.session_for_target(tid))
+        if not self._token_ok(gen, target_id=tid):
+            raise cdp_policy.Denied("ownership changed during state refresh")
+        ok, res = await self._model_send("Target.activateTarget", norm)
+        if not self._token_ok(gen, target_id=tid):
+            raise cdp_policy.Denied("ownership lost during call; result discarded")
+        return {"result": res} if ok else {"error": res}
+
+    async def _policy_close(self, norm):
+        pol, reg = self.policy, self.policy.registry
+        tid = norm["targetId"]
+        gen = reg.generation
+        await pol.refresh_target(self._trusted_send, tid, reg.session_for_target(tid))
+        if not self._token_ok(gen, target_id=tid):
+            raise cdp_policy.Denied("ownership changed during state refresh")
+        ok, res = await self._model_send("Target.closeTarget", norm)
+        if ok and reg.generation == gen:
+            reg.revoke_target(tid)  # closed → permanently gone, with every descendant
+        return {"result": res} if ok else {"error": res}
+
+    async def _policy_set_session(self, req):
+        """Untrusted meta: switch the current page only to an owned (session, page)
+        pair that passes a trusted live-state refresh and gets critical Page
+        monitoring installed."""
+        pol, reg = self.policy, self.policy.registry
+        if not reg.infrastructure_ok():
+            raise cdp_policy.Denied("policy not operational (not ready)")
+        sid, tid = req.get("session_id"), req.get("target_id")
+        pol.check_set_session(sid, tid)
+        gen = reg.generation
+        await pol.refresh_target(self._trusted_send, tid, sid)
+        if not self._token_ok(gen, sid, tid):
+            raise cdp_policy.Denied("ownership changed during state refresh")
+        if not reg.page_monitored(sid):
+            try:
+                await self._enable_policy_monitoring(sid)
+            except Exception:
+                raise cdp_policy.Denied("critical page monitoring could not be installed") from None
+            if not self._token_ok(gen, sid, tid) or not reg.page_monitored(sid):
+                raise cdp_policy.Denied("ownership changed during monitoring setup")
+        reg.set_current(sid, tid)
+        self.session = sid
+        self.target_id = tid
+        self._schedule_tab_marker(sid)
+        return {"session_id": sid}
+
+    async def _policy_model_meta(self, meta):
+        """Model-safe meta with ownership filtering; nothing stale/foreign leaks."""
+        pol, reg = self.policy, self.policy.registry
+        if meta == "drain_events":
+            out = [e for e in self.events
+                   if isinstance(e.get("session_id"), str) and reg.session_owned(e["session_id"])]
+            self.events.clear()
+            return {"events": out}
+        if meta == "pending_dialog":
+            visible = (self.dialog is not None and self.dialog_session is not None
+                       and self.dialog_session == reg.current_session_id and reg.current_pair_valid())
+            return {"dialog": self.dialog if visible else None}
+        if not reg.infrastructure_ok() or not reg.current_pair_valid():
+            raise cdp_policy.Denied("no valid owned current page")
+        if meta == "session":
+            return {"session_id": reg.current_session_id}
+        # current_tab: consume a trusted live-state refresh of the owned current page
+        tid, sid, gen = reg.current_target_id, reg.current_session_id, reg.generation
+        info = await pol.refresh_target(self._trusted_send, tid, sid)
+        if not self._token_ok(gen, sid, tid) or reg.current_target_id != tid or not reg.current_pair_valid():
+            raise cdp_policy.Denied("current page changed")
+        return {"targetId": tid, "url": info.get("url", ""), "title": info.get("title", "")}
+
+    async def handle(self, req, peer=None):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
         # this check is a no-op there (AF_UNIX + chmod 600 is the boundary).
@@ -670,6 +1172,13 @@ class Daemon:
         if expected is not None and req.get("token") != expected:
             return {"error": "unauthorized"}
         meta = req.get("meta")
+        # Policy mode: screen EVERY request before any model-origin send_raw.
+        # ``peer`` is the connecting socket (host-peer identity for management
+        # meta). Non-policy mode leaves behavior exactly as upstream.
+        if self.policy is not None:
+            decision = await self._enforce_policy(req, meta, peer)
+            if decision is not _POLICY_PASS:
+                return decision
         # Liveness probe — lets clients confirm the listener is actually this
         # daemon and not an unrelated process that reused our port post-crash.
         # `pid` lets restart_daemon() verify the live daemon's identity before
@@ -813,7 +1322,10 @@ async def serve(d):
         try:
             line = await reader.readline()
             if not line: return
-            resp = await d.handle(json.loads(line))
+            # The connecting socket carries the peer's kernel identity (uid +
+            # pid/net/mnt namespaces) used to gate management meta in policy mode.
+            peer = writer.get_extra_info("socket")
+            resp = await d.handle(json.loads(line), peer=peer)
             writer.write((json.dumps(resp, default=str) + "\n").encode())
             await writer.drain()
         except Exception as e:
@@ -860,6 +1372,23 @@ async def serve(d):
                             log(f"close dedicated tab on shutdown: {e}")
         else:
             log("skip dedicated-tab cleanup: stale-session recovery did not stop")
+        if d.policy is not None:
+            # Stop connection watching (no reconnect during shutdown) and drop the
+            # Hermes context with its tabs; best effort.
+            if d._policy_watch is not None:
+                d._policy_watch.cancel()
+                try:
+                    await d._policy_watch
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await d._policy_cancel_discovery()
+            d.policy.registry.mark_disconnected()
+            ctx = d.policy.registry.browser_context_id
+            if ctx and d.cdp:
+                try:
+                    await d.cdp.send_raw("Target.disposeBrowserContext", {"browserContextId": ctx})
+                except Exception as e:
+                    log(f"dispose Hermes context on shutdown: {e}")
         ipc.cleanup_endpoint(NAME)
 
 
