@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -357,6 +358,25 @@ def _is_local_chrome_mode(env=None):
     )
 
 
+def _cdp_url_unreachable(env=None):
+    """``(url, error)`` when the explicitly configured ``BU_CDP_URL`` endpoint cannot be
+    reached by ONE ``/json/version`` request (same endpoint and per-request timeout as
+    the daemon's ``get_ws_url``), else None. ``BU_CDP_WS`` (which the daemon uses first),
+    local discovery and any HTTP answer (403/404 included) are never "unreachable"."""
+    e = {**os.environ, **(env or {})}
+    url = e.get("BU_CDP_URL")
+    if not url or e.get("BU_CDP_WS"):
+        return None
+    url = url.rstrip("/")
+    try:
+        urllib.request.urlopen(f"{url}/json/version", timeout=5).close()
+    except urllib.error.HTTPError:
+        return None
+    except (OSError, ValueError) as err:
+        return url, err
+    return None
+
+
 def _daemon_wait_windows(wait, local):
     """Return normal startup and Chrome-approval wait windows in seconds."""
     explicit_wait = wait is not None
@@ -548,6 +568,16 @@ def ensure_daemon(wait=None, name=None, env=None):
             # unclassified daemon best-effort could orphan a Cloud browser.
             stop_remote_daemon(name or NAME)
         else:
+            # A replacement cannot help while the configured browser endpoint itself is
+            # unreachable: it would only wait out get_ws_url and fail. Leave the running
+            # daemon in place (a policy daemon reconnects by itself) and fail fast; once the
+            # endpoint answers again, a daemon that is still not healthy is replaced below.
+            if unreachable := _cdp_url_unreachable(env):
+                url, err = unreachable
+                raise RuntimeError(
+                    f"browser-unavailable: BU_CDP_URL={url} is not reachable ({err}); the running "
+                    "daemon was left in place -- retry once the browser is back"
+                )
             restart_daemon(name)
 
     import subprocess, sys
