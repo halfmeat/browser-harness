@@ -102,6 +102,15 @@ _VK_MAX = 0xFFFF
 # Upper bound for each trusted state-refresh call; a hung refresh is a DENY.
 TRUSTED_TIMEOUT = 5.0
 
+# Live Chromium reports TargetInfo.url == "" for a few ms right after Page.navigate
+# (~6-7 ms on Chrome 153) while Page.getFrameTree already holds the new URL. An
+# empty URL is a TRANSIENT UNKNOWN — never a safe URL and never proof of a
+# contradiction: re-read it after each of these delays, all within the hard
+# budget (seconds, measured from the first empty read). Still empty → DENY
+# without revoke, so a later action can refresh again.
+EMPTY_URL_RETRY_DELAYS = (0.005, 0.01, 0.02, 0.04)
+EMPTY_URL_RETRY_BUDGET = 0.1
+
 
 class PolicyConfigError(Exception):
     """``BH_CDP_POLICY`` held a value other than unset/empty/'v1' — fail closed."""
@@ -861,10 +870,10 @@ class PolicyEngine:
             raise Denied("set_session: session not owned for that target")
 
     # -- trusted live-state refresh --
-    async def _target_info(self, trusted, target_id):
+    async def _target_info(self, trusted, target_id, timeout=TRUSTED_TIMEOUT):
         try:
             info = (await asyncio.wait_for(trusted("Target.getTargetInfo", {"targetId": target_id}, None),
-                                           TRUSTED_TIMEOUT)).get("targetInfo")
+                                           timeout)).get("targetInfo")
         except Exception as e:
             raise Denied(f"trusted state refresh failed ({type(e).__name__})") from None
         if not isinstance(info, dict):
@@ -875,6 +884,39 @@ class PolicyEngine:
         self.registry.revoke_target(target_id)
         raise Denied(why)
 
+    async def _page_info(self, trusted, target_id):
+        """Trusted TargetInfo of an owned page with a NON-EMPTY string URL. Every
+        read gets the identity check (contradiction → revoke). An empty URL is
+        re-read with bounded async backoff (EMPTY_URL_RETRY_*); if it stays empty
+        → DENY with NO revoke (unknown is neither allowed nor proof of abuse)."""
+        reg = self.registry
+        gen = reg.generation
+        loop = asyncio.get_running_loop()
+        delays = iter(EMPTY_URL_RETRY_DELAYS)
+        deadline = None
+        timeout = TRUSTED_TIMEOUT
+        while True:
+            info = await self._target_info(trusted, target_id, timeout)
+            if (info.get("targetId") != target_id or info.get("type") != "page"
+                    or not reg.context_matches(info.get("browserContextId"))):
+                self._revoke_deny(target_id, "contradictory target state")
+            url = info.get("url")
+            if not isinstance(url, str):
+                self._revoke_deny(target_id, "unknown top-level URL")
+            if url:
+                return info
+            if deadline is None:
+                deadline = loop.time() + EMPTY_URL_RETRY_BUDGET
+            delay = next(delays, None)
+            if delay is None:
+                raise Denied("top-level URL not yet known (transient); not revoked")
+            await asyncio.sleep(max(0.0, min(delay, deadline - loop.time())))
+            if reg.generation != gen or reg.target_type(target_id) != "page":
+                raise Denied("ownership changed during state refresh")
+            timeout = deadline - loop.time()
+            if timeout <= 0:
+                raise Denied("top-level URL not yet known (transient); not revoked")
+
     async def refresh_target(self, trusted, target_id, session_id=None, frames=True):
         """Prove the CURRENT live state of an already-owned target before a model
         action. Pages: Target.getTargetInfo (+ Page.getFrameTree on an owned
@@ -883,7 +925,8 @@ class PolicyEngine:
         refreshes clean. ``frames=False`` (dialog handling: the renderer is blocked)
         uses only browser-side Target.getTargetInfo. Malformed/unknown/contradictory
         state → DENY + revoke; forbidden active URL → permanent revoke; trusted
-        errors/timeouts → DENY (fail closed)."""
+        errors/timeouts and a still-empty TargetInfo.url (transient unknown, see
+        ``_page_info``) → DENY without revoke (fail closed)."""
         reg = self.registry
         ttype = reg.target_type(target_id)
         if ttype == "iframe":
@@ -899,13 +942,8 @@ class PolicyEngine:
             return info
         if ttype != "page":
             raise Denied("target not owned")
-        info = await self._target_info(trusted, target_id)
-        if (info.get("targetId") != target_id or info.get("type") != "page"
-                or not reg.context_matches(info.get("browserContextId"))):
-            self._revoke_deny(target_id, "contradictory target state")
-        url = info.get("url")
-        if not isinstance(url, str):
-            self._revoke_deny(target_id, "unknown top-level URL")
+        info = await self._page_info(trusted, target_id)
+        url = info["url"]
         if session_id is not None and frames:
             try:
                 tree = (await asyncio.wait_for(trusted("Page.getFrameTree", {}, session_id),
