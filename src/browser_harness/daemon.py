@@ -893,16 +893,21 @@ class Daemon:
     async def _policy_reconnect(self, attempts=3):
         """New connection → new generation → new Hermes context → download-deny →
         monitoring → owned page/session → only then ready. Never adopts a foreign
-        tab. On failure the policy stays not-ready (fail closed)."""
+        tab. On failure the policy stays not-ready (fail closed). A connection that
+        failed the startup contract is stopped before the next attempt; after the last
+        failed attempt there is no further pause and no further automatic attempt."""
         reg = self.policy.registry
         old_ctx = reg.browser_context_id
         for attempt in range(attempts):
             if self._shutting_down:
                 return False
+            previous, candidate = self.cdp, None
             try:
-                self.cdp = await self._new_cdp_client()
+                candidate = await self._new_cdp_client()
+                self.cdp = candidate
                 self._install_event_tap()
                 await self._start_policy()
+                candidate = None  # adopted: the policy is installed on it, it is the operational client
                 if old_ctx and old_ctx != reg.browser_context_id:
                     try:
                         await self._trusted_send("Target.disposeBrowserContext", {"browserContextId": old_ctx})
@@ -912,12 +917,34 @@ class Daemon:
                 return True
             except Exception as e:
                 log(f"policy: reconnect attempt {attempt + 1}/{attempts} failed: {e}")
-                failed_ctx = reg.browser_context_id
                 reg.mark_disconnected()
-                if failed_ctx and failed_ctx != old_ctx and self.cdp is not None:
-                    await self._trusted_cleanup("Target.disposeBrowserContext", {"browserContextId": failed_ctx})
+            finally:
+                # Any exit before adoption -- a failed attempt, or shutdown cancelling this
+                # task (CancelledError keeps propagating after the cleanup) -- tears it down.
+                if candidate is not None:
+                    await self._discard_reconnect_candidate(candidate, previous, old_ctx, reg)
+            if attempt + 1 < attempts:
                 await asyncio.sleep(min(2 ** attempt, 5))
+        if not (self._shutting_down or self._ws_url_stop.is_set()):
+            log(f"policy: reconnect exhausted after {attempts} failed attempts; no further automatic "
+                "attempts (not ready until this daemon is replaced)")
         return False
+
+    async def _discard_reconnect_candidate(self, candidate, previous, old_ctx, reg):
+        """Tear down a reconnect connection that was never adopted: the registry stays
+        disconnected, the Hermes context it created is disposed over it, it is stopped (its
+        WebSocket and message/keepalive tasks) and the client it displaced is put back, so the
+        next attempt never overwrites a live, unowned client. Only ``candidate`` is stopped."""
+        failed_ctx = reg.browser_context_id
+        reg.mark_disconnected()
+        if failed_ctx and failed_ctx != old_ctx and self.cdp is candidate:
+            await self._trusted_cleanup("Target.disposeBrowserContext", {"browserContextId": failed_ctx})
+        if self.cdp is candidate:
+            self.cdp = previous
+        try:
+            await candidate.stop()
+        except Exception as e:
+            log(f"policy: stopping the failed reconnect connection: {type(e).__name__}: {e}")
 
     def _policy_current_dialog_open(self):
         """A JS dialog is CONFIRMED open on the current owned pair: reported by

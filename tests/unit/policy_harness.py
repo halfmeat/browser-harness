@@ -36,9 +36,13 @@ class FakeBrowser:
         self._ctx_n = 0
         self._event_registry = _Reg()
         self._message_handler_task = None
+        self.stopped = 0
 
     async def start(self):
         return None
+
+    async def stop(self):
+        self.stopped += 1
 
     def add_target(self, tid, ttype="page", url="https://user.example/", ctx="DEFAULT", parent_frame=None):
         t = {"targetId": tid, "type": ttype, "url": url, "browserContextId": ctx, "title": f"title-{tid}"}
