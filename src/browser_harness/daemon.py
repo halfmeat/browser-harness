@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, socket, sys, threading, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
@@ -274,7 +274,29 @@ def _ws_from_devtools_active_port(http_url: str) -> str | None:
     return None
 
 
-def get_ws_url():
+class EndpointDiscoveryCancelled(RuntimeError):
+    """get_ws_url() gave up early because its ``stop`` event was set (daemon shutdown)."""
+
+
+def _discovery_check(stop):
+    if stop is not None and stop.is_set():
+        raise EndpointDiscoveryCancelled("browser endpoint discovery cancelled: daemon shutting down")
+
+
+def _discovery_pause(stop, seconds):
+    """get_ws_url()'s retry pause: time.sleep() without ``stop``; with one, a wait that ends
+    (and cancels discovery) as soon as the event is set."""
+    if stop is None:
+        time.sleep(seconds)
+    elif stop.wait(seconds):
+        _discovery_check(stop)
+
+
+def get_ws_url(stop=None):
+    """Resolve the browser's CDP WebSocket URL, waiting up to ~30 s for it to come up.
+    ``stop`` (a threading.Event) makes the wait cooperatively cancellable when this runs in
+    a worker thread: it is checked before every attempt and interrupts every retry pause, so
+    a shutting-down daemon waits at most for one in-flight request (its own timeout)."""
     if url := os.environ.get("BU_CDP_WS"):
         return url
     if url := os.environ.get("BU_CDP_URL"):
@@ -285,6 +307,7 @@ def get_ws_url():
         last_err = None
         base_url = url.rstrip("/")
         while time.time() < deadline:
+            _discovery_check(stop)
             try:
                 return json.loads(urllib.request.urlopen(f"{base_url}/json/version", timeout=5).read())["webSocketDebuggerUrl"]
             except urllib.error.HTTPError as e:
@@ -293,10 +316,10 @@ def get_ws_url():
                     raise RuntimeError("permission-blocked: Chrome is reachable, but the per-session Allow remote debugging popup has not been accepted")
                 if e.code == 404 and (ws := _ws_from_devtools_active_port(url)):
                     return ws
-                time.sleep(1)
+                _discovery_pause(stop, 1)
             except Exception as e:
                 last_err = e
-                time.sleep(1)
+                _discovery_pause(stop, 1)
         hint = "is the dedicated automation Chrome running? Launch it with --remote-debugging-port=<port> --user-data-dir=<dedicated dir>"
         if platform.system() == "Windows":
             hint += "; on Windows also check that a firewall/antivirus isn't blocking localhost connections"
@@ -304,6 +327,7 @@ def get_ws_url():
     deadline = time.time() + 30
     next_liveness_check = 0.0
     while time.time() < deadline:
+        _discovery_check(stop)
         for base in PROFILES:
             try:
                 active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
@@ -447,6 +471,9 @@ class Daemon:
         self._recoveries_idle = asyncio.Event()
         self._recoveries_idle.set()
         self._shutting_down = False
+        # Set when serve() exits: cancels a reconnect's get_ws_url() worker thread, which
+        # interpreter shutdown would otherwise wait out (default-executor join).
+        self._ws_url_stop = threading.Event()
         self._session_replacements = {}
         self.events = deque(maxlen=BUF)
         self.dialog = None
@@ -684,7 +711,8 @@ class Daemon:
     async def _new_cdp_client(self):
         # get_ws_url() may poll (urllib + time.sleep) until the browser is back;
         # run it off the event-loop thread so IPC (ping → ready=false) stays responsive.
-        url = await asyncio.to_thread(get_ws_url)
+        # Cancelling this await does not stop the thread: shutdown sets _ws_url_stop.
+        url = await asyncio.to_thread(get_ws_url, self._ws_url_stop)
         log(f"connecting to {_safe_connection_label(url)}")
         cdp = _PatientCDPClient(url) if BROWSER_KIND == "local" else CDPClient(url)
         await cdp.start()
@@ -1348,6 +1376,9 @@ async def serve(d):
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
+        # Before anything else: a reconnect blocked in get_ws_url() (worker thread) must
+        # notice shutdown, or asyncio.run()'s executor join holds the process for ~30 s.
+        d._ws_url_stop.set()
         for t in (serve_task, stop_task):
             t.cancel()
             try: await t

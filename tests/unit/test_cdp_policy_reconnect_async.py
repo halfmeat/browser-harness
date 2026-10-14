@@ -29,7 +29,7 @@ def test_reconnect_wait_for_browser_does_not_block_event_loop(monkeypatch):
     entered, release = threading.Event(), threading.Event()
     inside = {"now": False}
 
-    def blocking_get_ws_url():  # stands in for urllib + time.sleep(1) polling
+    def blocking_get_ws_url(stop=None):  # stands in for urllib + time.sleep(1) polling
         inside["now"] = True
         entered.set()
         release.wait(3)  # safety bound: an event-loop-blocking caller stalls here
